@@ -688,4 +688,353 @@ export class Bird {
   private sinkRate(): number {
     const lift = smoothstep(STALL_SPEED, CRUISE_MAX, this.airSpeed)
     const thin = smoothstep(CEILING_START, CEILING_STOP, this.altitude)
-    return lerp(SINK_SLOW, SINK_FAST, lift) + thin *
+    return lerp(SINK_SLOW, SINK_FAST, lift) + thin * THIN_AIR_SINK
+  }
+
+  /** Climb sources fade out as the air thins so you cannot simply leave the planet. */
+  private ceilingFade(): number {
+    return 1 - smoothstep(CEILING_START, CEILING_STOP, this.altitude)
+  }
+
+  private applyGlideSink(dt: number, input: FlightInput): number {
+    if (input.brake) return 0
+    const drop = this.sinkRate() * dt
+    this.position.addScaledVector(this.localUp, -drop)
+    // Height falling away buys a little speed back, so a long glide trims out instead of stalling.
+    const cap = this.tuck ? this.sprintCap : CRUISE_MAX
+    if (this.speed < cap) this.speed = Math.min(cap, this.speed + drop * SINK_ENERGY)
+    return drop
+  }
+
+  private applyClimbBleed(dy: number, dt: number): void {
+    const steep = clamp((this.pitch - CLIMB_NOSE) / (MAX_CLIMB_PITCH - CLIMB_NOSE), 0, 1)
+    const climbRate = clamp(dy / Math.max(dt, 1 / 120) / 22, 0, 1)
+    const intensity = clamp(steep * 0.55 + climbRate * 0.45, 0, 1)
+    const momentum = clamp((this.speed - MIN_SPEED) / (CRUISE_MAX - MIN_SPEED), 0, 1)
+    const limp = (1 - momentum) * (1 - momentum)
+    const energy = lerp(CLIMB_ENERGY_FAST, CLIMB_ENERGY_SLOW, limp)
+    const cap = lerp(CLIMB_BLEED_CAP_FAST, CLIMB_BLEED_CAP_SLOW, limp) * dt
+    this.speed -= Math.min(cap, dy * energy * (0.65 + intensity * 0.55))
+  }
+
+  private applySpeedCap(dt: number, braking: boolean): void {
+    const floor = braking ? 1 : MIN_SPEED
+    if (this.tuck) {
+      this.speed = clamp(this.speed, floor, this.sprintCap)
+      return
+    }
+    if (this.speed > CRUISE_MAX) {
+      this.speed = damp(this.speed, CRUISE_MAX, SPRINT_BLEED, dt)
+      if (this.speed < CRUISE_MAX + 0.85) this.speed = CRUISE_MAX
+      this.speed = Math.max(this.speed, floor)
+      return
+    }
+    this.speed = clamp(this.speed, floor, CRUISE_MAX)
+  }
+
+  private applyThrottle(dt: number, input: FlightInput): void {
+    if (input.brake || input.throttle <= 0) return
+    const cap = this.tuck ? this.sprintCap : CRUISE_MAX
+    if (this.speed >= cap) {
+      this.speed = cap
+      return
+    }
+    this.speed = Math.min(cap, this.speed + THROTTLE_ACCEL * input.throttle * dt)
+  }
+
+  private beatPeriod(): number {
+    const t = clamp((this.speed - MIN_SPEED) / (this.sprintCap - MIN_SPEED), 0, 1)
+    return SLOW_PERIOD + (FAST_PERIOD - SLOW_PERIOD) * (t * 0.7 + t * t * 0.3)
+  }
+
+  private beginBeat(): void {
+    this.fromLift = this.lift
+    this.fromSweep = this.sweep
+    this.fromFold = this.elbowFold
+    this.stroke = 0.75
+    this.flapBlend = 0
+    this.seenApex = false
+    this.flapStage = 'beat'
+  }
+
+  private advanceFlap(dt: number): void {
+    if (this.flapStage !== 'beat') return
+    this.stroke += dt / this.beatPeriod()
+    this.flapBlend = Math.min(1, this.flapBlend + dt * 8)
+    if (this.stroke < 1) return
+    this.stroke -= 1
+    this.flapBlend = 1
+    if (this.autoFlap) {
+      this.call = 'Slow air — climbing to stay aloft'
+      this.callTimer = 0.35
+    }
+    if (this.seenApex && !this.holdFlap) {
+      this.flapStage = 'idle'
+      return
+    }
+    this.seenApex = true
+  }
+
+  private flapOnce(): void {
+    if (this.tuck) {
+      this.call = 'Wings tucked — climb after you open'
+      this.callTimer = 0.55
+      return
+    }
+
+    let lift = FLAP_LIFT
+    if (this.flapStage === 'idle') {
+      this.combo = Math.max(1, this.combo)
+      this.call = 'Climb'
+      this.pendingLift += lift
+      this.callTimer = 0.55
+      this.beginBeat()
+      return
+    }
+    const early = this.stroke < LATE_START
+    if (early) {
+      this.combo = 0
+      lift = FLAP_LIFT * (0.28 + this.stroke * 0.35)
+      this.call = 'Cut short'
+    } else {
+      const quality = clamp((this.stroke - LATE_START) / (1 - LATE_START), 0, 1)
+      this.combo += 1
+      lift = FLAP_LIFT * (0.7 + quality * 0.45) + Math.min(this.combo, 7) * 0.22
+      this.call = this.combo > 1 ? `Climb · combo ${this.combo}` : 'Climb'
+    }
+    this.pendingLift += lift
+    this.callTimer = 0.55
+  }
+
+  private updateBeatCue(dt: number): void {
+    this.meterActive = this.flapStage !== 'idle'
+    this.inWindow = this.flapStage === 'beat' && this.stroke >= LATE_START
+    this.beatApproach = this.flapStage === 'beat' ? this.stroke : 0
+    this.beatCue = this.inWindow ? clamp((this.stroke - LATE_START) / (1 - LATE_START), 0, 1) : 0
+    this.callTimer = Math.max(0, this.callTimer - dt)
+    if (this.callTimer > 0) return
+    if (this.autoFlap) this.call = 'Slow air — climbing to stay aloft'
+    else if (this.flapStage === 'idle') this.call = 'Hold Space to climb'
+    else this.call = 'Climbing'
+  }
+
+  private animate(dt: number, input: FlightInput): void {
+    if (this.walking) {
+      this.lift = damp(this.lift, TUCK_LIFT, 10, dt)
+      this.sweep = damp(this.sweep, -0.08, 10, dt)
+      this.elbowFold = damp(this.elbowFold, 0.96, 10, dt)
+    } else if (this.tuck) {
+      this.lift = damp(this.lift, SPRINT.lift, 11, dt)
+      this.sweep = damp(this.sweep, SPRINT.sweep, 11, dt)
+      this.elbowFold = damp(this.elbowFold, SPRINT.fold, 11, dt)
+    } else if (this.flapStage === 'beat') {
+      const pose = this.seenApex
+        ? sampleCycle(this.stroke)
+        : lerpPose(GLIDE, UP, clamp((this.stroke - 0.75) / 0.25, 0, 1))
+      this.lift = lerp(this.fromLift, pose.lift, this.flapBlend)
+      this.sweep = lerp(this.fromSweep, pose.sweep, this.flapBlend)
+      this.elbowFold = lerp(this.fromFold, pose.fold, this.flapBlend)
+    } else {
+      this.lift = damp(this.lift, GLIDE.lift, 4.5, dt)
+      this.sweep = damp(this.sweep, GLIDE.sweep, 4.5, dt)
+      this.elbowFold = damp(this.elbowFold, GLIDE.fold, 4.5, dt)
+    }
+
+    const bankAmt = this.walking ? 0 : clamp(Math.abs(this.visualRoll) / VISUAL_BANK_MAX, 0, 1)
+    if (!this.walking && !this.tuck && bankAmt > 0.02) {
+      const pulled = lerpPose(
+        { lift: this.lift, sweep: this.sweep, fold: this.elbowFold },
+        BANK,
+        bankAmt,
+      )
+      this.lift = pulled.lift
+      this.sweep = pulled.sweep
+      this.elbowFold = pulled.fold
+    }
+
+    const tuck = this.walking ? 0.38 : this.tuck ? 0.72 : bankAmt * 0.44
+    const bank = this.walking ? 0 : this.visualRoll
+    this.leftWing.rotation.z = this.lift - bank * WING_BANK
+    this.rightWing.rotation.z = -this.lift - bank * WING_BANK
+    this.leftWing.rotation.x = clamp(-this.lift, 0, 0.55) * 0.18
+    this.rightWing.rotation.x = clamp(-this.lift, 0, 0.55) * 0.18
+    this.leftWing.rotation.y = -this.sweep - tuck + bank * 0.08
+    this.rightWing.rotation.y = this.sweep + tuck + bank * 0.08
+
+    const fold = Math.max(0, this.elbowFold)
+    this.leftElbow.rotation.z = -fold
+    this.rightElbow.rotation.z = fold
+    this.leftElbow.rotation.y = -0.08 - fold * 0.12
+    this.rightElbow.rotation.y = 0.08 + fold * 0.12
+    this.leftElbow.rotation.x = fold * 0.06
+    this.rightElbow.rotation.x = fold * 0.06
+    this.leftTip.rotation.x = 0
+    this.rightTip.rotation.x = 0
+    this.leftTip.rotation.y = 0
+    this.rightTip.rotation.y = 0
+
+    const lookYaw = clamp(input.yaw * 0.28, -0.4, 0.4)
+    const lookPitch = clamp(input.pitch * 0.22, -0.35, 0.35)
+    this.headRig.rotation.y = damp(this.headRig.rotation.y, lookYaw, 8, dt)
+    this.headRig.rotation.x = damp(this.headRig.rotation.x, -lookPitch, 8, dt)
+    this.headRig.rotation.z = damp(this.headRig.rotation.z, -this.visualRoll * 0.28, 10, dt)
+    this.tail.rotation.y = damp(this.tail.rotation.y, -lookYaw * 0.55, 6, dt)
+    this.animateLegs(dt)
+  }
+
+  private animateLegs(dt: number): void {
+    const nearLand = this.speed < LAND_SPEED && this.altitude < FEET_NEAR
+    const wantFeet = this.walking || nearLand ? 1 : 0
+    this.feet = damp(this.feet, wantFeet, 8, dt)
+    const tucked = 1.35
+    const planted = 0.12
+    const base = lerp(tucked, planted, this.feet)
+    const step = this.walking ? Math.sin(this.walkPhase) * 0.52 * Math.min(1, Math.abs(this.speed) / 1.4) : 0
+    this.leftLeg.rotation.x = base + step
+    this.rightLeg.rotation.x = base - step
+    this.leftLeg.visible = this.feet > 0.04
+    this.rightLeg.visible = this.feet > 0.04
+  }
+
+  private refreshFrame(planet: Planet): void {
+    planet.radialUp(this.position, this.localUp)
+    this.heading.addScaledVector(this.localUp, -this.heading.dot(this.localUp))
+    if (this.heading.lengthSq() < 1e-8) {
+      planet.tangentBasis(this.localUp, this._east, this._north)
+      this.heading.copy(this._north)
+    } else {
+      this.heading.normalize()
+    }
+    this.right.crossVectors(this.localUp, this.heading).normalize()
+    if (this.right.lengthSq() < 1e-8) {
+      planet.tangentBasis(this.localUp, this.right, this._north)
+    }
+    this.forward.copy(this.heading).applyAxisAngle(this.right, -this.pitch)
+    this.up.crossVectors(this.forward, this.right).normalize()
+    if (this.up.dot(this.localUp) < 0) this.up.negate()
+    this.right.crossVectors(this.up, this.forward).normalize()
+  }
+
+  private placeShadow(planet: Planet): void {
+    planet.surfacePoint(this.position, this.shadow.position)
+    planet.normalAt(this.position, this._shadowN)
+    this.shadow.position.addScaledVector(this._shadowN, 0.08)
+    this.shadow.quaternion.setFromUnitVectors(Z_AXIS, this._shadowN)
+    const blob = this.shadow.material as MeshBasicMaterial
+    blob.opacity = clamp(0.26 - this.altitude / 90, 0.04, 0.26)
+    this.shadow.scale.setScalar(clamp(1.15 + this.altitude * 0.04, 1.1, 2.6))
+  }
+
+  private syncGroup(dt: number): void {
+    const facePitch = this.walking ? 0.04 : this.pitch
+    const visMag = lerp(VISUAL_BANK_SLOW, VISUAL_BANK_FAST, this.turnStyle)
+    let faceRoll = 0
+    if (!this.walking) {
+      if (Math.abs(this.steer) > 0.05) {
+        faceRoll = -this.steer * visMag
+      } else {
+        const maxPhys = lerp(MAX_BANK_SLOW, MAX_BANK_FAST, this.turnStyle)
+        const commit = maxPhys > 1e-4 ? clamp(Math.abs(this.roll) / maxPhys, 0, 1) : 0
+        faceRoll = Math.sign(this.roll) * visMag * commit
+      }
+      faceRoll = clamp(faceRoll, -VISUAL_BANK_MAX, VISUAL_BANK_MAX)
+    }
+
+    if (dt <= 0) {
+      this.visualPitch = facePitch
+      this.visualRoll = faceRoll
+    } else {
+      this.visualPitch = damp(this.visualPitch, facePitch, 14, dt)
+      this.visualRoll = damp(this.visualRoll, faceRoll, 18, dt)
+    }
+
+    this._visFwd.copy(this.heading).applyAxisAngle(this.right, -this.visualPitch)
+    this._visRight.crossVectors(this.localUp, this._visFwd)
+    if (this._visRight.lengthSq() < 1e-8) this._visRight.copy(this.right)
+    else this._visRight.normalize()
+    this._visUp.crossVectors(this._visFwd, this._visRight).normalize()
+    if (this._visUp.dot(this.localUp) < 0) this._visUp.negate()
+    this._visUp.applyAxisAngle(this._visFwd, this.visualRoll)
+    this._visRight.crossVectors(this._visUp, this._visFwd).normalize()
+    this.basis.makeBasis(this._visRight, this._visUp, this._visFwd)
+    this.group.quaternion.setFromRotationMatrix(this.basis)
+    this.group.position.copy(this.position)
+  }
+}
+
+function lerpPose(a: WingPose, b: WingPose, t: number): WingPose {
+  return {
+    lift: lerp(a.lift, b.lift, t),
+    sweep: lerp(a.sweep, b.sweep, t),
+    fold: lerp(a.fold, b.fold, t),
+  }
+}
+
+function catmull(p0: number, p1: number, p2: number, p3: number, t: number): number {
+  const t2 = t * t
+  const t3 = t2 * t
+  return 0.5 * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3)
+}
+
+function sampleCycle(t: number): WingPose {
+  const poses = [UP, EARLY, POWER, LATE]
+  const n = poses.length
+  const x = ((t % 1) + 1) % 1 * n
+  const i = Math.floor(x) % n
+  const u = x - Math.floor(x)
+  const a = poses[(i + n - 1) % n]
+  const b = poses[i]
+  const c = poses[(i + 1) % n]
+  const d = poses[(i + 2) % n]
+  return {
+    lift: catmull(a.lift, b.lift, c.lift, d.lift, u),
+    sweep: catmull(a.sweep, b.sweep, c.sweep, d.sweep, u),
+    fold: Math.max(0, catmull(a.fold, b.fold, c.fold, d.fold, u)),
+  }
+}
+
+/** Terrain touch sits slightly inside the analytic surface so faceted hills don't bump open air. */
+const GROUND_SLACK = 0.55
+
+function makeWing(
+  sign: number,
+  top: MeshLambertMaterial,
+  edge: MeshLambertMaterial,
+): { root: Group; elbow: Group; tip: Mesh } {
+  const root = new Group()
+  root.position.set(sign * 0.2, 0.08, 0.05)
+
+  const upper = new Mesh(new ConeGeometry(0.15, 0.92, 5), top)
+  upper.rotation.z = sign * Math.PI / 2
+  upper.position.set(sign * 0.4, 0.02, -0.02)
+  upper.scale.set(0.72, 1, 1.28)
+
+  const elbow = new Group()
+  elbow.position.set(sign * 0.86, 0.03, -0.06)
+
+  const forearm = new Mesh(new ConeGeometry(0.11, 0.82, 5), top)
+  forearm.rotation.z = sign * Math.PI / 2
+  forearm.position.set(sign * 0.36, 0.01, -0.04)
+  forearm.scale.set(0.52, 1, 1.22)
+
+  const tip = new Mesh(new ConeGeometry(0.075, 0.52, 4), edge)
+  tip.rotation.z = sign * Math.PI / 2
+  tip.position.set(sign * 0.8, 0.05, -0.14)
+  tip.scale.set(0.38, 1, 1.4)
+
+  elbow.add(forearm, tip)
+  root.add(upper, elbow)
+  return { root, elbow, tip }
+}
+
+function makeLeg(sign: number, legMat: MeshLambertMaterial, footMat: MeshLambertMaterial): Group {
+  const leg = new Group()
+  leg.position.set(sign * 0.16, -0.18, 0.04)
+  const thigh = new Mesh(new CylinderGeometry(0.035, 0.045, 0.32, 5), legMat)
+  thigh.position.y = -0.14
+  const foot = new Mesh(new BoxGeometry(0.08, 0.035, 0.18), footMat)
+  foot.position.set(0, -0.3, 0.06)
+  leg.add(thigh, foot)
+  leg.visible = false
+  return leg
+}
