@@ -372,4 +372,320 @@ export class Bird {
     this.syncGroup(dt)
     this.lastPos.copy(this.position)
     this.lastAlt = this.altitude
-    t
+    this.lastRadial = this.position.length()
+  }
+
+  private updateWalk(dt: number, input: FlightInput, planet: Planet, forest: Forest): void {
+    // Holding Space has to work too: after a landing the one-shot flap is already spent.
+    if (input.flap || input.glide) {
+      this.walking = false
+      this.pitch = 0.12
+      this.speed = Math.max(this.speed, MIN_SPEED * 2)
+      this.position.addScaledVector(this.localUp, TAKEOFF_LIFT)
+      this.flapOnce()
+      this.flushClimbLift()
+      this.lastPos.copy(this.position)
+      this.lastAlt = planet.altitude(this.position)
+      this.lastRadial = this.position.length()
+      return
+    }
+
+    const mouseTurn = input.freeLook ? 0 : -input.mouseYaw * 0.0032
+    const yawDelta = input.yaw * 2.1 * dt + mouseTurn
+    this.yaw = wrapAngle(this.yaw + yawDelta)
+    this.pitch = damp(this.pitch, 0.02, 8, dt)
+    this.roll = damp(this.roll, 0, 8, dt)
+
+    const want = input.throttle > 0 ? WALK_SPEED : input.pitch > 0 ? -1.4 : 0
+    const halt = input.brake ? 6 : 5
+    this.speed = damp(this.speed, want, halt, dt)
+
+    this.refreshFrame(planet)
+    this.heading.applyAxisAngle(this.localUp, yawDelta)
+    this.position.addScaledVector(this.heading, this.speed * dt)
+    planet.placeAbove(this.position, WALK_HEIGHT)
+    this.refreshFrame(planet)
+    this.resolveTrees(dt, forest)
+    this.hitDepth = this._push.length()
+    planet.placeAbove(this.position, WALK_HEIGHT)
+    this.refreshFrame(planet)
+
+    this.altitude = WALK_HEIGHT
+    this.walkPhase += Math.abs(this.speed) * 4.8 * dt
+    this.airSpeed = this.speed
+    this.flapStage = 'idle'
+    this.meterActive = false
+    this.call = 'Walking · Space to climb aloft'
+
+    this.animate(dt, input)
+    this.placeShadow(planet)
+    const blob = this.shadow.material as MeshBasicMaterial
+    blob.opacity = 0.28
+    this.shadow.scale.setScalar(1.2)
+    this.syncGroup(dt)
+    this.lastPos.copy(this.position)
+    this.lastAlt = this.altitude
+    this.lastRadial = this.position.length()
+  }
+
+  private resolveGround(dt: number, planet: Planet, braking: boolean): void {
+    const agl = planet.altitude(this.position)
+    const altitude = agl + GROUND_SLACK
+    const step = Math.max(dt, 1 / 120)
+    const vy = (agl - this.lastAlt) / step
+    // Sink and braking are descents the player asked for, so they must not read as a fall.
+    const fall = (agl - this.lastAlt + this.descentAssist) / step
+
+    const settling =
+      this.speed < LAND_SPEED &&
+      fall > -LAND_SINK &&
+      this.pitch > -0.2 &&
+      agl <= LAND_ALT &&
+      // Walking the seabed is not landing; over water you rest on the surface instead.
+      planet.radiusAt(this.position) >= SEA_LEVEL
+
+    if (settling) {
+      planet.placeAbove(this.position, WALK_HEIGHT)
+      this.startWalk()
+      return
+    }
+
+    if (altitude > TOUCH_SKIN) {
+      this.stuck = Math.max(0, this.stuck - dt)
+      return
+    }
+
+    planet.normalAt(this.position, this.groundNormal)
+    this.position.addScaledVector(this.groundNormal, TOUCH_SKIN - altitude)
+    const lifted = planet.altitude(this.position)
+    if (lifted < TOUCH_SKIN) this.position.addScaledVector(this.groundNormal, TOUCH_SKIN - lifted)
+    if (!braking) this.takeImpact(-fall, IMPACT_FREE, IMPACT_FULL, IMPACT_LOSS, 'Clipped the ground')
+    if (vy < -2 || this.pitch < 0) {
+      const stoop = clamp(-this.pitch / MAX_DIVE_PITCH, 0, 1)
+      this.pitch = damp(this.pitch, 0.14, 8 + stoop * 4, dt)
+    }
+    this.stuck = Math.max(0, this.stuck - dt)
+  }
+
+  /** Hitting something costs the speed you carried into it, scaled by how hard you arrived. */
+  private takeImpact(closing: number, free: number, full: number, loss: number, call: string): void {
+    const force = clamp((closing - free) / (full - free), 0, 1)
+    if (force <= 0) return
+    this.speed = Math.max(MIN_SPEED, this.speed * (1 - loss * force))
+    if (force > 0.25) {
+      this.call = call
+      this.callTimer = 0.6
+    }
+  }
+
+  /** The sea is a floor, not scenery — you skim it or you lose your speed to it. */
+  private resolveWater(dt: number, braking: boolean, planet: Planet): void {
+    const surface = SEA_LEVEL + WATER_SKIN
+    const radial = this.position.length()
+    if (radial >= surface || radial < 1e-6) return
+    // Only where the sea actually covers the ground; low-lying land is still land.
+    if (planet.radiusAt(this.position) >= SEA_LEVEL) return
+
+    const closing = (this.lastRadial - radial) / Math.max(dt, 1 / 120)
+    this.position.multiplyScalar(surface / radial)
+    if (!braking) this.takeImpact(closing, SPLASH_FREE, SPLASH_FULL, SPLASH_LOSS, 'Splashdown')
+    if (this.pitch < 0) this.pitch = damp(this.pitch, 0.1, 9, dt)
+  }
+
+  private startWalk(): void {
+    this.walking = true
+    this.flapStage = 'idle'
+    this.speed = clamp(this.speed, 0, WALK_SPEED)
+    this.pitch = 0.02
+    this.roll = 0
+  }
+
+  private resolveTrees(dt: number, forest: Forest): void {
+    this._bodyA.copy(this.position).addScaledVector(this.forward, BODY_NOSE)
+    this._bodyB.copy(this.position).addScaledVector(this.forward, -BODY_TAIL)
+    const nearby = forest.query(this.position, TREE_QUERY)
+    let deepest = 0
+    this._push.set(0, 0, 0)
+
+    for (const tree of nearby) {
+      const hit = this.collideTree(tree)
+      if (hit > 0) deepest = Math.max(deepest, hit)
+    }
+
+    this.hitDepth = Math.max(this.hitDepth, deepest)
+
+    if (this._push.lengthSq() === 0) {
+      this.treeContact = false
+      this.stuck = Math.max(0, this.stuck - dt * 2)
+      return
+    }
+
+    this.position.add(this._push)
+    this._bodyA.copy(this.position).addScaledVector(this.forward, BODY_NOSE)
+    this._bodyB.copy(this.position).addScaledVector(this.forward, -BODY_TAIL)
+    // Only the strike costs speed; resting against bark should not bill you every frame.
+    if (!this.treeContact) {
+      this.takeImpact(deepest / Math.max(dt, 1 / 120), 10, 40, TREE_STRIKE_LOSS, 'Clipped a tree')
+    }
+    this.treeContact = true
+
+    // A push that exactly cancels your motion would pin you inside the crown forever.
+    const progress = this.position.distanceTo(this.lastPos)
+    if (progress < this.airSpeed * dt * 0.4) this.stuck += dt
+    else this.stuck = Math.max(0, this.stuck - dt * 2)
+
+    if (this.stuck > 0.4) {
+      this._escape.copy(this._push).normalize()
+      this.position.addScaledVector(this._escape, TREE_ESCAPE * dt)
+      this.call = 'Shaking free of the branches'
+      this.callTimer = 0.4
+    }
+  }
+
+  private collideTree(tree: TreeCollider): number {
+    this._rel.copy(this.position).sub(tree.pos)
+    const along = this._rel.dot(tree.up)
+    const top = treeHitTop(tree)
+    if (along > top + BODY_RADIUS + 0.8 || along < -BODY_RADIUS - 0.5) return 0
+
+    this._radial.copy(this._rel).addScaledVector(tree.up, -along)
+    const radial = this._radial.length()
+    const skirt = treeHitRadius(tree)
+    if (radial > skirt + BODY_RADIUS + 0.35) {
+      return this.hitShell(tree, 0, tree.foliageBase, tree.trunkHit, tree.trunkHit)
+    }
+
+    let deepest = this.hitShell(tree, 0, tree.foliageBase, tree.trunkHit, tree.trunkHit)
+    for (const shell of tree.shells) {
+      deepest = Math.max(deepest, this.hitShell(tree, shell.y0, shell.y1, shell.r0, shell.r1))
+    }
+    for (const blob of tree.blobs) {
+      this._axisA.copy(tree.pos).addScaledVector(tree.up, blob.along)
+      deepest = Math.max(deepest, this.hitSphere(this._axisA, blob.radius))
+    }
+    return deepest
+  }
+
+  /** Finite cone / cylinder with no spherical end-caps — empty air beside a taper stays free. */
+  private hitShell(tree: TreeCollider, y0: number, y1: number, r0: number, r1: number): number {
+    if (y1 <= y0) return 0
+    let deepest = 0
+    for (let i = 0; i <= BODY_SAMPLES; i++) {
+      const t = i / BODY_SAMPLES
+      this._hitA.lerpVectors(this._bodyA, this._bodyB, t)
+      deepest = Math.max(deepest, this.pointVsShell(tree, this._hitA, y0, y1, r0, r1))
+    }
+    return deepest
+  }
+
+  private pointVsShell(
+    tree: TreeCollider,
+    point: Vector3,
+    y0: number,
+    y1: number,
+    r0: number,
+    r1: number,
+  ): number {
+    this._rel.copy(point).sub(tree.pos)
+    const along = this._rel.dot(tree.up)
+    if (along < y0 || along > y1) return 0
+    const u = (along - y0) / (y1 - y0)
+    const radius = lerp(r0, r1, u)
+    this._radial.copy(this._rel).addScaledVector(tree.up, -along)
+    const gap = this._radial.length()
+    const pen = radius + BODY_RADIUS - gap
+    if (pen <= 0) return 0
+    if (gap > 1e-6) this._push.addScaledVector(this._radial.multiplyScalar(1 / gap), pen)
+    else this._push.addScaledVector(this.right, pen)
+    return pen
+  }
+
+  private hitSphere(center: Vector3, radius: number): number {
+    this._segA.subVectors(this._bodyB, this._bodyA)
+    const len2 = this._segA.lengthSq()
+    let t = 0
+    if (len2 > 1e-10) {
+      t = clamp(this._rel.copy(center).sub(this._bodyA).dot(this._segA) / len2, 0, 1)
+    }
+    this._hitA.copy(this._bodyA).addScaledVector(this._segA, t)
+    const gap = this._hitA.distanceTo(center)
+    const pen = radius + BODY_RADIUS - gap
+    if (pen <= 0) return 0
+    if (gap > 1e-6) this._push.addScaledVector(this._rel.copy(this._hitA).sub(center).normalize(), pen)
+    else this._push.addScaledVector(this.right, pen)
+    return pen
+  }
+
+  /** Knocked off balance by something that hit you rather than something you hit. */
+  stagger(fraction: number, call: string): void {
+    this.speed = Math.max(MIN_SPEED, this.speed * (1 - clamp(fraction, 0, 1)))
+    this.call = call
+    this.callTimer = 1.3
+  }
+
+  setSprintCap(value: number): void {
+    this.sprintCap = clamp(Math.round(value), SPRINT_CAP_MIN, SPRINT_CAP_MAX)
+  }
+
+  private refreshAutoFlap(braking: boolean): void {
+    const band = this.autoFlap ? STALL_CLEAR : STALL_SPEED
+    const want = !this.walking && !this.tuck && !braking && this.speed <= band
+    if (want && !this.autoFlap && this.flapStage === 'idle') {
+      this.call = 'Slow air — climbing to stay aloft'
+      this.callTimer = 0.45
+      this.beginBeat()
+    }
+    this.autoFlap = want
+  }
+
+  private flushClimbLift(): void {
+    if (this.pendingLift <= 0) return
+    this.position.addScaledVector(this.localUp, this.pendingLift * this.ceilingFade())
+    this.pendingLift = 0
+  }
+
+  private applyClimbLift(dt: number, input: FlightInput): void {
+    if (this.tuck || input.brake) return
+    this.flushClimbLift()
+    const fade = this.ceilingFade()
+    if (input.glide) {
+      this.position.addScaledVector(this.localUp, HOLD_CLIMB * fade * dt)
+    } else if (this.autoFlap) {
+      // Beating at stall holds you up rather than lifting you, so idling drifts down to land.
+      this.position.addScaledVector(this.localUp, Math.min(AUTO_LIFT * fade, this.sinkRate() * 0.92) * dt)
+    }
+  }
+
+  private applyEnergy(dt: number, braking: boolean): void {
+    if (braking) return
+    const radial = this.position.length()
+    const dRadial = radial - this.lastRadial
+    const expected = Math.sin(this.pitch) * this.speed * dt
+
+    if (this.pitch > CLIMB_NOSE) {
+      this.applyClimbBleed(Math.max(0, dRadial, expected), dt)
+      return
+    }
+
+    if (this.pitch < DIVE_NOSE && dRadial < 0) {
+      const gain = -dRadial * DIVE_ENERGY
+      if (this.tuck || this.speed < CRUISE_MAX) {
+        this.speed += gain
+        if (!this.tuck) this.speed = Math.min(this.speed, CRUISE_MAX)
+      }
+    }
+  }
+
+  private applySoarDrag(dt: number, input: FlightInput): void {
+    if (input.brake || input.throttle > 0 || this.tuck) return
+    if (this.pitch > CLIMB_NOSE || this.pitch < DIVE_NOSE) return
+    if (this.speed <= STALL_SPEED) return
+    const drag = SOAR_DRAG + this.speed * SOAR_DRAG_GAIN
+    this.speed = Math.max(STALL_SPEED, this.speed - drag * dt)
+  }
+
+  /** Wings only hold you up while you have air over them: fast is nearly flat, slow falls away. */
+  private sinkRate(): number {
+    const lift = smoothstep(STALL_SPEED, CRUISE_MAX, this.airSpeed)
+    const thin = smoothstep(CEILING_START, CEILING_STOP, this.altitude)
+    return lerp(SINK_SLOW, SINK_FAST, lift) + thin *
